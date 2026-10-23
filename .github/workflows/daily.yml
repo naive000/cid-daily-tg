@@ -37,6 +37,7 @@ jobs:
       - name: Fetch, convert, send
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TELEGRAPH_TOKEN: ${{ secrets.TELEGRAPH_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           DATE: ${{ inputs.date }}
           BACKFILL: ${{ inputs.backfill }}

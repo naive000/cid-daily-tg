@@ -43,27 +43,44 @@ def test_parse_days_and_entries():
     assert d[2].entries == []
 
 
-def test_render_escapes_and_converts():
-    e = days()[0].entries[1]
-    out = m.render_entry(e)
-    assert "Weird &lt;b&gt;" in out and "軟體 &amp; 工具" in out and "<br" not in out
-    first = m.render_entry(days()[0].entries[0])
-    assert '<a href="https://v.app/more">更多介紹</a>' in first
-    assert "開源語音輸入工具" in first
+def test_desc_segments_convert_and_keep_links():
+    e = days()[0].entries[0]
+    segs = m.desc_segments(e.desc)
+    assert ("開源語音輸入工具 - ", None) in segs and ("更多介紹", "https://v.app/more") in segs
+    odd = m.desc_segments(days()[0].entries[1].desc)
+    assert "".join(t for t, _ in odd) == "軟體 & 工具 第二行"  # <br/> 去掉、簡轉繁
 
 
 def test_desc_truncates_outside_links():
-    long = "字" * 700 + " [x](https://x.app)"
-    out = m.render_desc(long)
-    assert out.endswith("…") and "<a" not in out and len(out) <= m.DESC_LIMIT + 1
+    segs = m.desc_segments("字" * 700 + " [x](https://x.app)")
+    assert segs[-1][0].endswith("…") and all(u is None for _, u in segs)
+    assert sum(len(t) for t, _ in segs) <= m.DESC_LIMIT + 1
 
 
-def test_build_messages_split_under_limit():
-    day = m.Day(dt.date(2026, 10, 22), [m.Entry("white_check_mark", f"P{i}", f"https://p{i}.app", "介绍" * 200, "u", None)
-                                       for i in range(30)])
-    msgs = m.build_messages(day)
-    assert len(msgs) > 1 and all(len(x) <= 4096 for x in msgs)
-    assert "本日新增 30" in msgs[0] and m.SOURCE_REPO in msgs[-1]
+def test_index_text_escapes_and_lists():
+    day = days()[0]
+    text = m.build_index_text(day)
+    assert text.startswith("<b>🧑‍💻 中國獨立開發者日報 · 2026-10-22</b>") and "本日新增 3 個項目" in text
+    assert "・Voltip — 開源語音輸入工具" in text and "Weird &lt;b&gt;" in text
+    assert len(text) < 4096
+
+
+def test_index_caps_items():
+    day = m.Day(dt.date(2026, 10, 22), [m.Entry("white_check_mark", f"P{i}", f"https://p{i}.app", "介绍", "u", None)
+                                       for i in range(60)])
+    text = m.build_index_text(day)
+    assert text.count("・P") == m.INDEX_MAX_ITEMS and "另 20 個見全文" in text and len(text) < 4096
+
+
+def test_page_nodes_and_size_guard():
+    import json
+    day = days()[0]
+    nodes = json.loads(m.serialize_page(day))
+    h4 = [n for n in nodes if n["tag"] == "h4"]
+    assert len(h4) == 3 and h4[0]["children"][1] == {"tag": "a", "attrs": {"href": "https://v.app/"}, "children": ["Voltip"]}
+    big = m.Day(dt.date(2026, 10, 22), [m.Entry("white_check_mark", f"P{i}", f"https://p{i}.app", "介绍" * 300, "u", None)
+                                       for i in range(120)])
+    assert len(m.serialize_page(big).encode()) <= m.PAGE_LIMIT
 
 
 def test_pick_pending():

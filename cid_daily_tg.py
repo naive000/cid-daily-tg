@@ -2,7 +2,7 @@
 
 來源：1c7/chinese-independent-developer 主版面 README.md，每天一個「### YYYY 年 M 月 D 号添加」區塊。
 流程：抓 README → 找出尚未發送的「已結束日」（台北時間今天之前）→ 只把介紹文字簡轉繁（OpenCC s2twp）
-→ 合成 1～N 則 Telegram 訊息 → 全部成功才寫回 state.json。無 LLM。
+→ 建 Telegraph 全文頁 → 發頻道索引訊息（標題＋清單＋「閱讀全文」按鈕）→ 成功才寫回 state.json。無 LLM。
 """
 from __future__ import annotations
 
@@ -25,10 +25,14 @@ from opencc import OpenCC
 SOURCE_REPO = "1c7/chinese-independent-developer"
 SOURCE_URL = f"https://github.com/{SOURCE_REPO}"
 README_URL = f"https://raw.githubusercontent.com/{SOURCE_REPO}/master/README.md"
+TELEGRAPH_API = "https://api.telegra.ph"
+AUTHOR_NAME = "中國獨立開發者日報"
 STATE_PATH = Path(__file__).with_name("state.json")
 TAIPEI = dt.timezone(dt.timedelta(hours=8))
 
-MSG_LIMIT = 3800  # Telegram 單則 4096，留餘裕給 HTML 標籤
+INDEX_MAX_ITEMS = 40  # 索引訊息最多列幾個產品
+INDEX_TEASER = 26  # 索引每項摘要字數
+PAGE_LIMIT = 60000  # Telegraph 內容上限 64KB
 DESC_LIMIT = 600  # 單一項目介紹上限，超過截斷
 SEND_INTERVAL = 3.0  # 秒；同一聊天約 20 則／分鐘上限
 KEEPALIVE_DAYS = 25  # 公開 repo 60 天無活動會停排程
@@ -141,74 +145,135 @@ def parse_days(markdown: str) -> list[Day]:
 
 # ---------- Render ----------
 
-def render_desc(desc: str) -> str:
-    """介紹文字 → HTML：文字簡轉繁並跳脫，markdown 連結保留成錨點；超長在連結邊界外截斷。"""
+def desc_segments(desc: str, limit: int = DESC_LIMIT) -> list[tuple[str, str | None]]:
+    """介紹文字 → [(文字, 連結或 None)]：簡轉繁、保留 markdown 連結、超長在連結外截斷加「…」。"""
     desc = re.sub(r"<br\s*/?>", " ", desc)
     desc = re.sub(r"[*`]", "", desc)
-    out, used, pos = [], 0, 0
+    segs: list[tuple[str, str | None]] = []
+    used, pos = 0, 0
 
-    def add(text: str) -> bool:
+    def add_text(text: str) -> bool:
         nonlocal used
         text = to_tw(re.sub(r"\s+", " ", text))
-        room = DESC_LIMIT - used
+        room = limit - used
         if len(text) > room:
-            out.append(html.escape(text[:room].rstrip()) + "…")
+            segs.append((text[:room].rstrip() + "…", None))
             return False
-        out.append(html.escape(text))
+        segs.append((text, None))
         used += len(text)
         return True
 
     for m in MD_LINK_RE.finditer(desc):
-        if not add(desc[pos:m.start()]):
-            return "".join(out).strip()
+        if not add_text(desc[pos:m.start()]):
+            return segs
         label = to_tw(m.group(1))
-        out.append(f'<a href="{html.escape(m.group(2), quote=True)}">{html.escape(label)}</a>')
+        segs.append((label, m.group(2)))
         used += len(label)
         pos = m.end()
-    add(desc[pos:])
-    return "".join(out).strip()
+    add_text(desc[pos:])
+    return [(t, u) for t, u in segs if t]
 
 
-def render_entry(e: Entry) -> str:
+def plain_teaser(desc: str) -> str:
+    """索引訊息用的一句話摘要：純文字，取到第一個分句標點，過長截斷。"""
+    text = "".join(t for t, _ in desc_segments(desc, 200)).strip()
+    text = re.split(r"[，；。,;]", text, maxsplit=1)[0].strip()
+    return text[:INDEX_TEASER].rstrip() + ("…" if len(text) > INDEX_TEASER else "")
+
+
+def day_title(day: Day) -> str:
+    return f"中國獨立開發者日報 · {day.date.isoformat()}"
+
+
+def build_index_text(day: Day) -> str:
+    """頻道索引訊息（對標 ruanyf 週刊：標題＋清單＋「閱讀全文」按鈕）。"""
+    lines = [f"<b>🧑‍💻 {html.escape(day_title(day))}</b>", f"本日新增 {len(day.entries)} 個項目：", ""]
+    for e in day.entries[:INDEX_MAX_ITEMS]:
+        teaser = plain_teaser(e.desc)
+        lines.append(f"・{html.escape(e.name)}" + (f" — {html.escape(teaser)}" if teaser else ""))
+    if len(day.entries) > INDEX_MAX_ITEMS:
+        lines.append(f"…另 {len(day.entries) - INDEX_MAX_ITEMS} 個見全文")
+    return "\n".join(lines)
+
+
+# ---------- Telegraph ----------
+
+def _node(tag: str, attrs: dict | None = None, children: list | None = None) -> dict:
+    node: dict = {"tag": tag}
+    if attrs:
+        node["attrs"] = attrs
+    if children:
+        node["children"] = children
+    return node
+
+
+def _link(label: str, href: str) -> dict:
+    return _node("a", {"href": href}, [label])
+
+
+def entry_nodes(e: Entry, desc_limit: int = DESC_LIMIT) -> list:
     icon = STATUS_ICON.get(e.status, "•")
-    head = f'{icon} <a href="{html.escape(e.url, quote=True)}">{html.escape(e.name)}</a>'
+    nodes = [_node("h4", children=[f"{icon} ", _link(e.name, e.url)])]
     if e.author:
-        who = html.escape(e.author)
-        if e.author_url:
-            who = f'<a href="{html.escape(e.author_url, quote=True)}">{who}</a>'
-        head += f" · {who}"
-    desc = render_desc(e.desc)
-    return head + (f"\n{desc}" if desc else "")
+        who = _link(e.author, e.author_url) if e.author_url else e.author
+        nodes.append(_node("p", children=[_node("em", children=["作者：", who])]))
+    segs = desc_segments(e.desc, desc_limit)
+    if segs:
+        nodes.append(_node("p", children=[_link(t, u) if u else t for t, u in segs]))
+    return nodes
 
 
-def build_messages(day: Day) -> list[str]:
-    header = f"<b>🧑‍💻 中國獨立開發者 · {day.date.isoformat()}</b>\n本日新增 {len(day.entries)} 個項目"
-    footer = f'來源：<a href="{SOURCE_URL}">{SOURCE_REPO}</a>'
-    blocks = [render_entry(e) for e in day.entries]
-    messages: list[str] = []
-    cur = header
-    for b in blocks:
-        if len(cur) + len(b) + 2 > MSG_LIMIT:
-            messages.append(cur)
-            cur = ""
-        cur = f"{cur}\n\n{b}" if cur else b
-    if len(cur) + len(footer) + 2 > MSG_LIMIT:
-        messages.append(cur)
-        cur = footer
-    else:
-        cur = f"{cur}\n\n{footer}"
-    messages.append(cur)
-    return messages
+def serialize_page(day: Day) -> str:
+    """Telegraph 頁面內容（JSON nodes）。超過 64KB 上限就先縮短介紹，仍超過再砍尾端項目。"""
+    entries = day.entries
+    while True:
+        for limit in (DESC_LIMIT, 300, 120):
+            nodes: list = [_node("p", children=[
+                f"{day.date.isoformat()} 新增 {len(day.entries)} 個項目。繁體轉換版・來源 ",
+                _link(SOURCE_REPO, SOURCE_URL), "。"])]
+            for e in entries:
+                nodes += entry_nodes(e, limit)
+            if len(entries) < len(day.entries):
+                nodes.append(_node("p", children=[f"（篇幅限制，僅列出前 {len(entries)} 個，其餘請見來源 repo）"]))
+            nodes.append(_node("hr"))
+            nodes.append(_node("p", children=["原清單由 ", _link("1c7", "https://github.com/1c7"),
+                                              " 維護，產品與介紹皆由各投稿者提供。"]))
+            out = json.dumps(nodes, ensure_ascii=False, separators=(",", ":"))
+            if len(out.encode()) <= PAGE_LIMIT:
+                return out
+        entries = entries[: max(1, len(entries) // 2)]
+
+
+def telegraph_call(method: str, **params: str) -> dict:
+    body = urllib.parse.urlencode(params).encode()
+    raw = _request(f"{TELEGRAPH_API}/{method}", data=body,
+                   headers={"Content-Type": "application/x-www-form-urlencoded"}, label=f"telegraph {method}")
+    resp = json.loads(raw)
+    if not resp.get("ok"):
+        raise RuntimeError(f"telegraph {method}: {resp.get('error')}")
+    return resp["result"]
+
+
+def telegraph_create_account() -> str:
+    return telegraph_call("createAccount", short_name="cid-daily", author_name=AUTHOR_NAME,
+                          author_url=SOURCE_URL)["access_token"]
+
+
+def telegraph_create_page(token: str, day: Day) -> str:
+    result = telegraph_call("createPage", access_token=token, title=day_title(day)[:256], author_name=AUTHOR_NAME,
+                            author_url=SOURCE_URL, content=serialize_page(day), return_content="false")
+    return result["url"]
 
 
 # ---------- Telegram ----------
 
-def telegram_send(bot_token: str, chat_id: str, text: str) -> None:
+def telegram_send_index(bot_token: str, chat_id: str, day: Day, page_url: str) -> None:
     params = {
         "chat_id": chat_id,
-        "text": text,
+        "text": build_index_text(day),
         "parse_mode": "HTML",
-        "link_preview_options": json.dumps({"is_disabled": True}),
+        "reply_markup": json.dumps({"inline_keyboard": [[{"text": "閱讀全文", "url": page_url}]]}, ensure_ascii=False),
+        "link_preview_options": json.dumps({"url": page_url, "prefer_large_media": False}),
     }
     raw = _request(f"https://api.telegram.org/bot{bot_token}/sendMessage", data=urllib.parse.urlencode(params).encode(),
                    headers={"Content-Type": "application/x-www-form-urlencoded"}, label="telegram sendMessage")
@@ -255,23 +320,31 @@ def _require_env(*names: str) -> dict:
     return {n: os.environ[n] for n in names}
 
 
-def send_day(day: Day, env: dict, dry_run: bool) -> None:
-    msgs = build_messages(day)
-    for i, text in enumerate(msgs):
-        if dry_run:
-            print(f"--- {day.date} [{i + 1}/{len(msgs)}] ({len(text)} chars) ---\n{text}\n")
-            continue
-        with_flood_retry(lambda t=text: telegram_send(env["TG_BOT_TOKEN"], env["TG_CHAT_ID"], t))
-        time.sleep(SEND_INTERVAL)
+def send_day(day: Day, env: dict, state: dict, dry_run: bool) -> None:
+    if dry_run:
+        print(f"--- {day.date} index ---\n{build_index_text(day)}\n--- page ({len(serialize_page(day))} bytes) ---")
+        print(serialize_page(day)[:600], "...\n")
+        return
+    key = day.date.isoformat()
+    pages = state.setdefault("pages", {})
+    if key not in pages:  # Telegraph 頁建了刪不掉：發送失敗重試時重用，不重建
+        pages[key] = with_flood_retry(lambda: telegraph_create_page(env["TELEGRAPH_TOKEN"], day))
+        save_state(state)
+    with_flood_retry(lambda: telegram_send_index(env["TG_BOT_TOKEN"], env["TG_CHAT_ID"], day, pages[key]))
+    time.sleep(SEND_INTERVAL)
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", help="強制重發指定日期 YYYY-MM-DD")
     ap.add_argument("--backfill", type=int, default=0, help="補發最近 N 個已結束日（跳過已發）")
+    ap.add_argument("--create-telegraph-account", action="store_true", help="建立 Telegraph 帳號並印出 token")
     ap.add_argument("--dry-run", action="store_true", help="只印訊息，不發送、不寫 state")
     args = ap.parse_args(argv)
 
+    if args.create_telegraph_account:
+        sys.stdout.write(telegraph_create_account())
+        return 0
     today = dt.datetime.now(TAIPEI).date()
     state = load_state()
     days = parse_days(fetch_readme())
@@ -279,13 +352,14 @@ def main(argv: list[str] | None = None) -> int:
     pending = pick_pending(days, today, state.get("last_date"), forced, args.backfill, state.get("sent_dates"))
     print(f"today={today} last_date={state.get('last_date')} pending={[d.date.isoformat() for d in pending]}")
 
-    env = {} if args.dry_run else _require_env("TG_BOT_TOKEN", "TG_CHAT_ID")
+    env = {} if args.dry_run else _require_env("TG_BOT_TOKEN", "TG_CHAT_ID", "TELEGRAPH_TOKEN")
     try:
         for day in pending:
-            send_day(day, env, args.dry_run)
+            send_day(day, env, state, args.dry_run)
             if args.dry_run:
                 continue
             state["sent_dates"] = sorted(set(state.get("sent_dates", [])) | {day.date.isoformat()})[-SENT_DATES_KEEP:]
+            state["pages"] = {k: v for k, v in state.get("pages", {}).items() if k in state["sent_dates"] or k == day.date.isoformat()}
             if not forced and (not state.get("last_date") or day.date.isoformat() > state["last_date"]):
                 state["last_date"] = day.date.isoformat()
             state["last_sent"] = today.isoformat()
