@@ -2,8 +2,8 @@ name: daily
 
 on:
   schedule:
-    - cron: "17 1 * * *" # 09:17（台北）主發前一天
-    - cron: "23 13 * * *" # 21:23（台北）補查；已發過則無動作
+    - cron: "20 1 * * *" # 09:20（台北）主發前一天
+    - cron: "20 13 * * *" # 21:20（台北）補查；已發過則無動作
   workflow_dispatch:
     inputs:
       date:
